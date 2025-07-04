@@ -1,0 +1,767 @@
+#include "itensor/all.h"
+#include "itensor/util/print_macro.h"
+
+#include <vector>
+#include <cmath>
+#include <complex>
+#include <iostream>
+#include <string>
+#include <chrono>
+#include <memory>
+#include <thread>
+#include <future>
+#include <atomic>
+#include <algorithm>
+#include <execution>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include <pybind11.h>
+#include <stl.h>
+ 
+using namespace itensor;
+using namespace std::chrono;
+
+// Thread-safe performance monitoring
+class PerformanceMonitor {
+private:
+    std::atomic<size_t> total_contractions{0};
+    std::atomic<double> total_time{0.0};
+    std::atomic<size_t> max_bond_dim{0};
+    
+public:
+    void record_contraction(double time, size_t bond_dim) {
+        total_contractions++;
+        total_time += time;
+        
+        size_t current_max = max_bond_dim.load();
+        while (bond_dim > current_max && 
+               !max_bond_dim.compare_exchange_weak(current_max, bond_dim)) {
+            // Keep trying until we successfully update or find a larger value
+        }
+    }
+    
+    void print_stats() const {
+        std::cout << "=== Performance Statistics ===" << std::endl;
+        std::cout << "Total contractions: " << total_contractions.load() << std::endl;
+        std::cout << "Total time: " << total_time.load() << "s" << std::endl;
+        std::cout << "Average time per contraction: " 
+                  << (total_time.load() / std::max(1ul, total_contractions.load())) << "s" << std::endl;
+        std::cout << "Maximum bond dimension: " << max_bond_dim.load() << std::endl;
+        std::cout << "===============================" << std::endl;
+    }
+};
+
+// Global performance monitor
+thread_local PerformanceMonitor perf_monitor;
+
+// Optimized MPS state management
+class OptimizedMPSState {
+private:
+    MPS psi;
+    Qubit site_inds;
+    int N;
+    double cutoff;
+    std::vector<int> current_position;
+    
+    // Pre-allocated working tensors
+    mutable std::vector<ITensor> work_tensors;
+    
+public:
+    OptimizedMPSState(const Qubit& sites, int num_qubits, double cut) 
+        : site_inds(sites), N(num_qubits), cutoff(cut) {
+        
+        // Initialize with all spins up
+        auto init = InitState(site_inds);
+        for(auto n : range1(N)) {
+            init.set(n, "Up");
+        }
+        psi = MPS(init);
+        
+        // Pre-allocate working tensors
+        work_tensors.reserve(N);
+        for(int i = 0; i < N; ++i) {
+            work_tensors.emplace_back();
+        }
+    }
+    
+    // Optimized single-qubit gate application
+    void apply_single_gate(const ITensor& gate, int site) {
+        auto start = high_resolution_clock::now();
+        
+        psi.position(site + 1);
+        auto new_MPS = gate * psi(site + 1);
+        new_MPS.noPrime();
+        psi.set(site + 1, new_MPS);
+        
+        auto end = high_resolution_clock::now();
+        auto duration = duration_cast<microseconds>(end - start).count() / 1000000.0;
+        perf_monitor.record_contraction(duration, maxLinkDim(psi));
+    }
+    
+    // Optimized two-qubit gate application with improved SVD
+    void apply_two_gate(const ITensor& gate, int site1, int site2) {
+        auto start = high_resolution_clock::now();
+        
+        // Ensure proper ordering
+        if(site1 > site2) std::swap(site1, site2);
+        
+        psi.position(site1 + 1);
+        auto wf = psi(site1 + 1) * psi(site2 + 1);
+        wf = gate * wf;
+        wf.noPrime();
+        
+        // Optimized SVD with better cutoff management
+        auto svd_args = Args("Cutoff=", cutoff, 
+                           "MaxDim=", 1000,
+                           "SVDMethod=", "gesdd",  // Use divide-and-conquer SVD
+                           "UseOriginalTags=", true);
+        
+        auto [U, S, V] = svd(wf, commonInds(wf, psi(site1 + 1)), svd_args);
+        
+        psi.set(site1 + 1, U);
+        psi.position(site2 + 1);
+        psi.set(site2 + 1, S * V);
+        
+        auto end = high_resolution_clock::now();
+        auto duration = duration_cast<microseconds>(end - start).count() / 1000000.0;
+        perf_monitor.record_contraction(duration, maxLinkDim(psi));
+    }
+    
+    // Optimized expectation value calculation with parallel processing
+    template<typename T>
+    std::vector<std::vector<T>> calculate_xyz_expectations() const {
+        std::vector<std::vector<T>> result(N);
+        
+        // Parallel computation of expectation values
+        #pragma omp parallel for schedule(dynamic)
+        for(int i = 0; i < N; ++i) {
+            auto local_psi = psi;  // Thread-local copy
+            local_psi.position(i + 1);
+            
+            std::vector<T> xyz(3);
+            auto site_tensor = local_psi.A(i + 1);
+            auto dag_tensor = dag(prime(site_tensor, "Site"));
+            
+            // X expectation
+            auto x_op = site_inds.op("X_half", i + 1);
+            xyz[0] = static_cast<T>(eltC(dag_tensor * x_op * site_tensor).real());
+            
+            // Y expectation  
+            auto y_op = site_inds.op("Y_half", i + 1);
+            xyz[1] = static_cast<T>(eltC(dag_tensor * y_op * site_tensor).real());
+            
+            // Z expectation
+            auto z_op = site_inds.op("Z_half", i + 1);
+            xyz[2] = static_cast<T>(eltC(dag_tensor * z_op * site_tensor).real());
+            
+            result[i] = std::move(xyz);
+        }
+        
+        return result;
+    }
+    
+    const MPS& get_mps() const { return psi; }
+    int get_max_bond_dim() const { return maxLinkDim(psi); }
+};
+
+// Optimized gate application with caching
+class GateCache {
+private:
+    std::unordered_map<std::string, ITensor> cached_gates;
+    mutable std::mutex cache_mutex;
+    
+public:
+    ITensor get_or_create_gate(const std::string& key, 
+                              std::function<ITensor()> creator) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cached_gates.find(key);
+        if(it != cached_gates.end()) {
+            return it->second;
+        }
+        
+        auto gate = creator();
+        cached_gates[key] = gate;
+        return gate;
+    }
+    
+    void clear() {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cached_gates.clear();
+    }
+};
+
+thread_local GateCache gate_cache;
+
+MPS apply_gates3(std::vector<std::tuple<int,int,int,double>> circuits, 
+                Qubit site_inds, int N, double cutoff) {
+    
+    OptimizedMPSState mps_state(site_inds, N, cutoff);
+    
+    // Constants for performance
+    const double pi = M_PI;
+    const std::complex<double> i_unit(0.0, 1.0);
+    
+    // Process gates in batches for better cache utilization
+    const size_t batch_size = std::min(static_cast<size_t>(100), circuits.size());
+    
+    for(size_t batch_start = 0; batch_start < circuits.size(); batch_start += batch_size) {
+        size_t batch_end = std::min(batch_start + batch_size, circuits.size());
+        
+        // Apply gates in current batch
+        for(size_t idx = batch_start; idx < batch_end; ++idx) {
+            const auto& gate = circuits[idx];
+            auto sym = std::get<0>(gate);
+            auto i1 = std::get<1>(gate);
+            auto i2 = std::get<2>(gate);
+            auto a = std::get<3>(gate);
+            
+            double theta = (pi * a) / 2.0;
+            std::string gate_key = std::to_string(sym) + "_" + std::to_string(a);
+            
+            switch(sym) {
+                case 0: { // Hadamard
+                    auto G = gate_cache.get_or_create_gate(gate_key, [&]() {
+                        return op(site_inds, "H", i1 + 1, {"alpha=", a});
+                    });
+                    mps_state.apply_single_gate(G, i1);
+                    break;
+                }
+                case 1: { // Rx
+                    auto G = gate_cache.get_or_create_gate(gate_key, [&]() {
+                        return op(site_inds, "Rx", i1 + 1, {"alpha=", a});
+                    });
+                    mps_state.apply_single_gate(G, i1);
+                    break;
+                }
+                case 2: { // Rz
+                    auto G = gate_cache.get_or_create_gate(gate_key, [&]() {
+                        return op(site_inds, "Rz", i1 + 1, {"alpha=", a});
+                    });
+                    mps_state.apply_single_gate(G, i1);
+                    break;
+                }
+                case 3: { // XXPhase
+                    auto G = gate_cache.get_or_create_gate(gate_key, [&]() {
+                        auto opx1 = op(site_inds, "X", i1 + 1, {"alpha=", a});
+                        auto opx2 = op(site_inds, "X", i2 + 1, {"alpha=", a});
+                        return expHermitian(opx2 * opx1, -i_unit * theta);
+                    });
+                    mps_state.apply_two_gate(G, i1, i2);
+                    break;
+                }
+                case 4: { // ZZPhase
+                    auto G = gate_cache.get_or_create_gate(gate_key, [&]() {
+                        auto op1 = op(site_inds, "Z", i1 + 1, {"alpha=", a});
+                        auto op2 = op(site_inds, "Z", i2 + 1, {"alpha=", a});
+                        return expHermitian(op1 * op2, -i_unit * theta);
+                    });
+                    mps_state.apply_two_gate(G, i1, i2);
+                    break;
+                }
+                case 5: { // SWAP
+                    auto G = gate_cache.get_or_create_gate("SWAP", [&]() {
+                        auto swap_gate = op(site_inds, "Z", i1 + 1, {"alpha=", a}) * 
+                                       op(site_inds, "Z", i2 + 1, {"alpha=", a});
+                        
+                        // Manually set SWAP matrix elements
+                        swap_gate.set(1,1,2,2, 0);
+                        swap_gate.set(2,2,1,1, 0);
+                        swap_gate.set(1,2,2,1, 1);
+                        swap_gate.set(2,1,1,2, 1);
+                        return swap_gate;
+                    });
+                    mps_state.apply_two_gate(G, i1, i2);
+                    break;
+                }
+                default:
+                    std::cerr << "Unknown gate type: " << sym << std::endl;
+                    break;
+            }
+        }
+    }
+    
+    return mps_state.get_mps();
+}
+
+// Test functions
+int hello() {
+    std::cout << "Hello from optimized ITensor!" << std::endl;
+    return 0;
+}
+
+int main() {
+    // Set number of threads for OpenMP
+    #ifdef _OPENMP
+    int num_threads = std::thread::hardware_concurrency();
+    omp_set_num_threads(num_threads);
+    std::cout << "Using " << num_threads << " OpenMP threads" << std::endl;
+    #endif
+    
+    hello();
+    return 0;
+}
+
+template <typename T>
+T add(T i, T j) {
+    return i + j;
+}
+
+template <typename T>
+std::vector<T> list_return(std::vector<T> vector1) {
+    std::cout << "Vector_Function" << std::endl;
+    std::vector<T> vector2;
+    vector2.reserve(vector1.size());  // Pre-allocate memory
+    
+    for(size_t i = 0; i < vector1.size(); ++i) {
+        vector2.push_back(vector1[i]);
+    }
+    return vector2;
+}
+
+template<typename T1, typename T2>
+int tuple_return(std::vector<std::tuple<T1,T1,T1,T2>> vect_tup) {
+    std::cout << "Vec_Tup_Function" << std::endl;
+    std::cout << "Printing Vector of tuples" << std::endl;
+    
+    for(size_t i = 0; i < vect_tup.size(); ++i) {
+        std::cout << "[" << std::get<0>(vect_tup[i]) << "," 
+                  << std::get<1>(vect_tup[i]) << "," 
+                  << std::get<2>(vect_tup[i]) << "," 
+                  << std::get<3>(vect_tup[i]) << "]" << std::endl;
+    }
+    return 0;
+}
+
+template<typename T1, typename T2>
+std::vector<std::vector<T2>> circuit_xyz_exp(std::vector<std::tuple<T1,T1,T1,T2>> tensor_vec, 
+                                            int no_sites) {
+    auto start_total = high_resolution_clock::now();
+    
+    auto tensor_sites = Qubit(no_sites);
+    MPS tensor_mps = apply_gates3(tensor_vec, tensor_sites, no_sites, 1E-16);
+    
+    auto end_circuit = high_resolution_clock::now();
+    auto circuit_time = duration_cast<microseconds>(end_circuit - start_total).count() / 1000000.0;
+    
+    // Create optimized MPS state wrapper for expectation calculations
+    OptimizedMPSState mps_state(tensor_sites, no_sites, 1E-16);
+    
+    // Calculate expectation values using optimized parallel method
+    auto result = mps_state.calculate_xyz_expectations<T2>();
+    
+    auto end_total = high_resolution_clock::now();
+    auto total_time = duration_cast<microseconds>(end_total - start_total).count() / 1000000.0;
+    
+    // Print performance statistics
+    std::cout << "Circuit simulation time: " << circuit_time << "s" << std::endl;
+    std::cout << "Total execution time: " << total_time << "s" << std::endl;
+    std::cout << "Final bond dimension: " << maxLinkDim(tensor_mps) << std::endl;
+    
+    perf_monitor.print_stats();
+    
+    return result;
+}
+
+// Pybind11 module definition
+PYBIND11_MODULE(helloitensor, m) {
+    m.doc() = "Optimized ITensor quantum circuit simulation";
+
+    m.def("add", &add<float>, "A function that adds two numbers");
+    m.def("hello", &hello, "Hello function");
+    m.def("vec_return", &list_return<int>, "Return input list as a vector");
+    
+    // Multiple overloads for tuple_return
+    m.def("tuple_return", &tuple_return<int,float>, "Print vector of tuples");
+    m.def("tuple_return", &tuple_return<int,int>, "Print vector of tuples");
+    m.def("tuple_return", &tuple_return<float,float>, "Print vector of tuples");
+
+    m.def("circuit_xyz_exp", &circuit_xyz_exp<int,double>, 
+          "Optimized function to extract single qubit expectation values from circuit. "
+          "Returns list of num_qubit x,y,z exp values with improved performance.");
+}#include "itensor/all.h"
+#include "itensor/util/print_macro.h"
+
+#include <vector>
+#include <cmath>
+#include <complex>
+#include <iostream>
+#include <string>
+#include <chrono>
+#include <memory>
+#include <thread>
+#include <future>
+#include <atomic>
+#include <algorithm>
+#include <execution>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include <pybind11.h>
+#include <stl.h>
+ 
+using namespace itensor;
+using namespace std::chrono;
+
+// Thread-safe performance monitoring
+class PerformanceMonitor {
+private:
+    std::atomic<size_t> total_contractions{0};
+    std::atomic<double> total_time{0.0};
+    std::atomic<size_t> max_bond_dim{0};
+    
+public:
+    void record_contraction(double time, size_t bond_dim) {
+        total_contractions++;
+        total_time += time;
+        
+        size_t current_max = max_bond_dim.load();
+        while (bond_dim > current_max && 
+               !max_bond_dim.compare_exchange_weak(current_max, bond_dim)) {
+            // Keep trying until we successfully update or find a larger value
+        }
+    }
+    
+    void print_stats() const {
+        std::cout << "=== Performance Statistics ===" << std::endl;
+        std::cout << "Total contractions: " << total_contractions.load() << std::endl;
+        std::cout << "Total time: " << total_time.load() << "s" << std::endl;
+        std::cout << "Average time per contraction: " 
+                  << (total_time.load() / std::max(1ul, total_contractions.load())) << "s" << std::endl;
+        std::cout << "Maximum bond dimension: " << max_bond_dim.load() << std::endl;
+        std::cout << "===============================" << std::endl;
+    }
+};
+
+// Global performance monitor
+thread_local PerformanceMonitor perf_monitor;
+
+// Optimized MPS state management
+class OptimizedMPSState {
+private:
+    MPS psi;
+    Qubit site_inds;
+    int N;
+    double cutoff;
+    std::vector<int> current_position;
+    
+    // Pre-allocated working tensors
+    mutable std::vector<ITensor> work_tensors;
+    
+public:
+    OptimizedMPSState(const Qubit& sites, int num_qubits, double cut) 
+        : site_inds(sites), N(num_qubits), cutoff(cut) {
+        
+        // Initialize with all spins up
+        auto init = InitState(site_inds);
+        for(auto n : range1(N)) {
+            init.set(n, "Up");
+        }
+        psi = MPS(init);
+        
+        // Pre-allocate working tensors
+        work_tensors.reserve(N);
+        for(int i = 0; i < N; ++i) {
+            work_tensors.emplace_back();
+        }
+    }
+    
+    // Optimized single-qubit gate application
+    void apply_single_gate(const ITensor& gate, int site) {
+        auto start = high_resolution_clock::now();
+        
+        psi.position(site + 1);
+        auto new_MPS = gate * psi(site + 1);
+        new_MPS.noPrime();
+        psi.set(site + 1, new_MPS);
+        
+        auto end = high_resolution_clock::now();
+        auto duration = duration_cast<microseconds>(end - start).count() / 1000000.0;
+        perf_monitor.record_contraction(duration, maxLinkDim(psi));
+    }
+    
+    // Optimized two-qubit gate application with improved SVD
+    void apply_two_gate(const ITensor& gate, int site1, int site2) {
+        auto start = high_resolution_clock::now();
+        
+        // Ensure proper ordering
+        if(site1 > site2) std::swap(site1, site2);
+        
+        psi.position(site1 + 1);
+        auto wf = psi(site1 + 1) * psi(site2 + 1);
+        wf = gate * wf;
+        wf.noPrime();
+        
+        // Optimized SVD with better cutoff management
+        auto svd_args = Args("Cutoff=", cutoff, 
+                           "MaxDim=", 1000,
+                           "SVDMethod=", "gesdd",  // Use divide-and-conquer SVD
+                           "UseOriginalTags=", true);
+        
+        auto [U, S, V] = svd(wf, commonInds(wf, psi(site1 + 1)), svd_args);
+        
+        psi.set(site1 + 1, U);
+        psi.position(site2 + 1);
+        psi.set(site2 + 1, S * V);
+        
+        auto end = high_resolution_clock::now();
+        auto duration = duration_cast<microseconds>(end - start).count() / 1000000.0;
+        perf_monitor.record_contraction(duration, maxLinkDim(psi));
+    }
+    
+    // Optimized expectation value calculation with parallel processing
+    template<typename T>
+    std::vector<std::vector<T>> calculate_xyz_expectations() const {
+        std::vector<std::vector<T>> result(N);
+        
+        // Parallel computation of expectation values
+        #pragma omp parallel for schedule(dynamic)
+        for(int i = 0; i < N; ++i) {
+            auto local_psi = psi;  // Thread-local copy
+            local_psi.position(i + 1);
+            
+            std::vector<T> xyz(3);
+            auto site_tensor = local_psi.A(i + 1);
+            auto dag_tensor = dag(prime(site_tensor, "Site"));
+            
+            // X expectation
+            auto x_op = site_inds.op("X_half", i + 1);
+            xyz[0] = static_cast<T>(eltC(dag_tensor * x_op * site_tensor).real());
+            
+            // Y expectation  
+            auto y_op = site_inds.op("Y_half", i + 1);
+            xyz[1] = static_cast<T>(eltC(dag_tensor * y_op * site_tensor).real());
+            
+            // Z expectation
+            auto z_op = site_inds.op("Z_half", i + 1);
+            xyz[2] = static_cast<T>(eltC(dag_tensor * z_op * site_tensor).real());
+            
+            result[i] = std::move(xyz);
+        }
+        
+        return result;
+    }
+    
+    const MPS& get_mps() const { return psi; }
+    int get_max_bond_dim() const { return maxLinkDim(psi); }
+};
+
+// Optimized gate application with caching
+class GateCache {
+private:
+    std::unordered_map<std::string, ITensor> cached_gates;
+    mutable std::mutex cache_mutex;
+    
+public:
+    ITensor get_or_create_gate(const std::string& key, 
+                              std::function<ITensor()> creator) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = cached_gates.find(key);
+        if(it != cached_gates.end()) {
+            return it->second;
+        }
+        
+        auto gate = creator();
+        cached_gates[key] = gate;
+        return gate;
+    }
+    
+    void clear() {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cached_gates.clear();
+    }
+};
+
+thread_local GateCache gate_cache;
+
+MPS apply_gates3(std::vector<std::tuple<int,int,int,double>> circuits, 
+                Qubit site_inds, int N, double cutoff) {
+    
+    OptimizedMPSState mps_state(site_inds, N, cutoff);
+    
+    // Constants for performance
+    const double pi = M_PI;
+    const std::complex<double> i_unit(0.0, 1.0);
+    
+    // Process gates in batches for better cache utilization
+    const size_t batch_size = std::min(static_cast<size_t>(100), circuits.size());
+    
+    for(size_t batch_start = 0; batch_start < circuits.size(); batch_start += batch_size) {
+        size_t batch_end = std::min(batch_start + batch_size, circuits.size());
+        
+        // Apply gates in current batch
+        for(size_t idx = batch_start; idx < batch_end; ++idx) {
+            const auto& gate = circuits[idx];
+            auto sym = std::get<0>(gate);
+            auto i1 = std::get<1>(gate);
+            auto i2 = std::get<2>(gate);
+            auto a = std::get<3>(gate);
+            
+            double theta = (pi * a) / 2.0;
+            std::string gate_key = std::to_string(sym) + "_" + std::to_string(a);
+            
+            switch(sym) {
+                case 0: { // Hadamard
+                    auto G = gate_cache.get_or_create_gate(gate_key, [&]() {
+                        return op(site_inds, "H", i1 + 1, {"alpha=", a});
+                    });
+                    mps_state.apply_single_gate(G, i1);
+                    break;
+                }
+                case 1: { // Rx
+                    auto G = gate_cache.get_or_create_gate(gate_key, [&]() {
+                        return op(site_inds, "Rx", i1 + 1, {"alpha=", a});
+                    });
+                    mps_state.apply_single_gate(G, i1);
+                    break;
+                }
+                case 2: { // Rz
+                    auto G = gate_cache.get_or_create_gate(gate_key, [&]() {
+                        return op(site_inds, "Rz", i1 + 1, {"alpha=", a});
+                    });
+                    mps_state.apply_single_gate(G, i1);
+                    break;
+                }
+                case 3: { // XXPhase
+                    auto G = gate_cache.get_or_create_gate(gate_key, [&]() {
+                        auto opx1 = op(site_inds, "X", i1 + 1, {"alpha=", a});
+                        auto opx2 = op(site_inds, "X", i2 + 1, {"alpha=", a});
+                        return expHermitian(opx2 * opx1, -i_unit * theta);
+                    });
+                    mps_state.apply_two_gate(G, i1, i2);
+                    break;
+                }
+                case 4: { // ZZPhase
+                    auto G = gate_cache.get_or_create_gate(gate_key, [&]() {
+                        auto op1 = op(site_inds, "Z", i1 + 1, {"alpha=", a});
+                        auto op2 = op(site_inds, "Z", i2 + 1, {"alpha=", a});
+                        return expHermitian(op1 * op2, -i_unit * theta);
+                    });
+                    mps_state.apply_two_gate(G, i1, i2);
+                    break;
+                }
+                case 5: { // SWAP
+                    auto G = gate_cache.get_or_create_gate("SWAP", [&]() {
+                        auto swap_gate = op(site_inds, "Z", i1 + 1, {"alpha=", a}) * 
+                                       op(site_inds, "Z", i2 + 1, {"alpha=", a});
+                        
+                        // Manually set SWAP matrix elements
+                        swap_gate.set(1,1,2,2, 0);
+                        swap_gate.set(2,2,1,1, 0);
+                        swap_gate.set(1,2,2,1, 1);
+                        swap_gate.set(2,1,1,2, 1);
+                        return swap_gate;
+                    });
+                    mps_state.apply_two_gate(G, i1, i2);
+                    break;
+                }
+                default:
+                    std::cerr << "Unknown gate type: " << sym << std::endl;
+                    break;
+            }
+        }
+    }
+    
+    return mps_state.get_mps();
+}
+
+// Test functions
+int hello() {
+    std::cout << "Hello from optimized ITensor!" << std::endl;
+    return 0;
+}
+
+int main() {
+    // Set number of threads for OpenMP
+    #ifdef _OPENMP
+    int num_threads = std::thread::hardware_concurrency();
+    omp_set_num_threads(num_threads);
+    std::cout << "Using " << num_threads << " OpenMP threads" << std::endl;
+    #endif
+    
+    hello();
+    return 0;
+}
+
+template <typename T>
+T add(T i, T j) {
+    return i + j;
+}
+
+template <typename T>
+std::vector<T> list_return(std::vector<T> vector1) {
+    std::cout << "Vector_Function" << std::endl;
+    std::vector<T> vector2;
+    vector2.reserve(vector1.size());  // Pre-allocate memory
+    
+    for(size_t i = 0; i < vector1.size(); ++i) {
+        vector2.push_back(vector1[i]);
+    }
+    return vector2;
+}
+
+template<typename T1, typename T2>
+int tuple_return(std::vector<std::tuple<T1,T1,T1,T2>> vect_tup) {
+    std::cout << "Vec_Tup_Function" << std::endl;
+    std::cout << "Printing Vector of tuples" << std::endl;
+    
+    for(size_t i = 0; i < vect_tup.size(); ++i) {
+        std::cout << "[" << std::get<0>(vect_tup[i]) << "," 
+                  << std::get<1>(vect_tup[i]) << "," 
+                  << std::get<2>(vect_tup[i]) << "," 
+                  << std::get<3>(vect_tup[i]) << "]" << std::endl;
+    }
+    return 0;
+}
+
+template<typename T1, typename T2>
+std::vector<std::vector<T2>> circuit_xyz_exp(std::vector<std::tuple<T1,T1,T1,T2>> tensor_vec, 
+                                            int no_sites) {
+    auto start_total = high_resolution_clock::now();
+    
+    auto tensor_sites = Qubit(no_sites);
+    MPS tensor_mps = apply_gates3(tensor_vec, tensor_sites, no_sites, 1E-16);
+    
+    auto end_circuit = high_resolution_clock::now();
+    auto circuit_time = duration_cast<microseconds>(end_circuit - start_total).count() / 1000000.0;
+    
+    // Create optimized MPS state wrapper for expectation calculations
+    OptimizedMPSState mps_state(tensor_sites, no_sites, 1E-16);
+    
+    // Calculate expectation values using optimized parallel method
+    auto result = mps_state.calculate_xyz_expectations<T2>();
+    
+    auto end_total = high_resolution_clock::now();
+    auto total_time = duration_cast<microseconds>(end_total - start_total).count() / 1000000.0;
+    
+    // Print performance statistics
+    std::cout << "Circuit simulation time: " << circuit_time << "s" << std::endl;
+    std::cout << "Total execution time: " << total_time << "s" << std::endl;
+    std::cout << "Final bond dimension: " << maxLinkDim(tensor_mps) << std::endl;
+    
+    perf_monitor.print_stats();
+    
+    return result;
+}
+
+// Pybind11 module definition
+PYBIND11_MODULE(helloitensor, m) {
+    m.doc() = "Optimized ITensor quantum circuit simulation";
+
+    m.def("add", &add<float>, "A function that adds two numbers");
+    m.def("hello", &hello, "Hello function");
+    m.def("vec_return", &list_return<int>, "Return input list as a vector");
+    
+    // Multiple overloads for tuple_return
+    m.def("tuple_return", &tuple_return<int,float>, "Print vector of tuples");
+    m.def("tuple_return", &tuple_return<int,int>, "Print vector of tuples");
+    m.def("tuple_return", &tuple_return<float,float>, "Print vector of tuples");
+
+    m.def("circuit_xyz_exp", &circuit_xyz_exp<int,double>, 
+          "Optimized function to extract single qubit expectation values from circuit. "
+          "Returns list of num_qubit x,y,z exp values with improved performance.");
+}
