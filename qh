@@ -1,0 +1,331 @@
+//
+// Copyright 2018 The Simons Foundation, Inc. - All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+#pragma once
+
+#include "itensor/all.h"
+#include "itensor/mps/siteset.h"
+#include "itensor/util/str.h"
+
+#include <cmath>
+#include <complex>
+#include <unordered_map>
+#include <memory>
+#include <thread>
+#include <mutex>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+namespace itensor {
+
+class QubitSite;
+
+using Qubit = BasicSiteSet<QubitSite>;
+
+// Thread-safe operator cache for better performance
+class OperatorCache {
+private:
+    mutable std::mutex cache_mutex;
+    mutable std::unordered_map<std::string, ITensor> op_cache;
+    static constexpr size_t MAX_CACHE_SIZE = 1000;
+    
+public:
+    ITensor* get(const std::string& key) const {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        auto it = op_cache.find(key);
+        return (it != op_cache.end()) ? &(it->second) : nullptr;
+    }
+    
+    void put(const std::string& key, const ITensor& op) const {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        if (op_cache.size() < MAX_CACHE_SIZE) {
+            op_cache[key] = op;
+        }
+    }
+    
+    void clear() const {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        op_cache.clear();
+    }
+};
+
+// Memory pool for tensor operations
+class TensorMemoryPool {
+private:
+    static constexpr size_t POOL_SIZE = 100;
+    mutable std::mutex pool_mutex;
+    mutable std::vector<std::unique_ptr<ITensor>> available_tensors;
+    
+public:
+    std::unique_ptr<ITensor> acquire(const Index& s1, const Index& s2) const {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        
+        if (!available_tensors.empty()) {
+            auto tensor = std::move(available_tensors.back());
+            available_tensors.pop_back();
+            // Reset tensor indices
+            *tensor = ITensor(s1, s2);
+            return tensor;
+        }
+        
+        return std::make_unique<ITensor>(s1, s2);
+    }
+    
+    void release(std::unique_ptr<ITensor> tensor) const {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        if (available_tensors.size() < POOL_SIZE) {
+            available_tensors.push_back(std::move(tensor));
+        }
+    }
+};
+
+class QubitSite
+    {
+    Index s;
+    mutable OperatorCache op_cache;
+    mutable TensorMemoryPool tensor_pool;
+    
+    // Pre-computed constants for performance
+    static constexpr double PI = 3.14159265358979323846;
+    static constexpr double SQRT2_INV = 0.7071067811865476;
+    static const std::complex<double> I_UNIT;
+    
+    // Cache commonly used values
+    mutable std::unordered_map<double, std::complex<double>> exp_cache;
+    mutable std::mutex exp_cache_mutex;
+    
+    std::complex<double> cached_exp(double theta) const {
+        std::lock_guard<std::mutex> lock(exp_cache_mutex);
+        auto it = exp_cache.find(theta);
+        if (it != exp_cache.end()) {
+            return it->second;
+        }
+        
+        auto result = std::exp(I_UNIT * theta);
+        if (exp_cache.size() < 1000) {  // Limit cache size
+            exp_cache[theta] = result;
+        }
+        return result;
+    }
+    
+    public:
+
+    QubitSite(Index const& I) : s(I) { }
+
+    QubitSite(Args const& args = Args::global())
+        {
+        auto ts = TagSet("Site,Qubit");
+        if( args.defined("SiteNumber") )
+          ts.addTags("n="+str(args.getInt("SiteNumber")));
+        auto conserveqns = args.getBool("ConserveQNs",false);
+        auto conserveSz = args.getBool("ConserveSz",conserveqns);
+        auto conserveParity = args.getBool("ConserveParity",false);
+        if(conserveSz && conserveParity)
+            {
+            s = Index(QN({"Sz",+1},{"Parity",1,2}),1,
+                      QN({"Sz",-1},{"Parity",0,2}),1,Out,ts);
+            }
+        else if(conserveSz)
+            {
+            s = Index(QN({"Sz",+1}),1,
+                      QN({"Sz",-1}),1,Out,ts);
+            }
+        else if(conserveParity)
+            {
+            s = Index(QN({"Parity",1,2}),1,
+                      QN({"Parity",0,2}),1,Out,ts);
+            }
+        else
+            {
+            s = Index(2,ts);
+            }
+        }
+
+    Index
+    index() const { return s; }
+
+    IndexVal
+    state(std::string const& state)
+        {
+        if(state == "Up") 
+            {
+            return s(1);
+            }
+        else 
+        if(state == "Dn") 
+            {
+            return s(2);
+            }
+        else
+            {
+            throw ITError("State " + state + " not recognized");
+            }
+        return IndexVal{};
+        }
+
+	ITensor
+	op(std::string const& opname,
+	   Args const& args = Args::global()) const
+        {
+        auto alpha = args.getReal("alpha",0.75);
+        
+        // Create cache key including alpha parameter
+        std::string cache_key = opname + "_" + std::to_string(alpha);
+        
+        // Check cache first
+        ITensor* cached_op = op_cache.get(cache_key);
+        if (cached_op != nullptr) {
+            return *cached_op;
+        }
+
+        double theta = 1.0;
+        auto sP = prime(s);
+
+        auto Up = s(1);
+        auto UpP = sP(1);
+        auto Dn = s(2);
+        auto DnP = sP(2);
+
+        // Use memory pool for better performance
+        auto Op_ptr = tensor_pool.acquire(dag(s), sP);
+        ITensor& Op = *Op_ptr;
+
+        theta = (PI * alpha) / 2.0;
+
+        if(opname == "Rz")
+            {
+            auto exp_neg = cached_exp(-theta);
+            auto exp_pos = cached_exp(theta);
+            Op.set(Up,UpP, exp_neg);
+            Op.set(Dn,DnP, exp_pos);
+            }
+        else if(opname == "Z")
+            {
+            Op.set(Up,UpP, 1.0);
+            Op.set(Dn,DnP, -1.0);
+            }
+        else if(opname == "H")
+            {
+            Op.set(Up,UpP, SQRT2_INV);
+            Op.set(Up,DnP, SQRT2_INV);
+            Op.set(Dn,UpP, SQRT2_INV);
+            Op.set(Dn,DnP, SQRT2_INV);
+            }
+        else if(opname == "Rx")
+            {
+            auto cos_theta = std::cos(theta);
+            auto sin_theta_i = std::sin(theta) * (-I_UNIT);
+            Op.set(Up,UpP, cos_theta);
+            Op.set(Dn,DnP, cos_theta);
+            Op.set(Up,DnP, sin_theta_i);
+            Op.set(Dn,UpP, sin_theta_i);
+            }
+        else if(opname == "X")
+            {
+            Op.set(Up,DnP, 1.0);
+            Op.set(Dn,UpP, 1.0);
+            }
+        else if(opname == "X_half")
+            {
+            Op.set(Up,DnP, 0.5);
+            Op.set(Dn,UpP, 0.5);
+            }
+        else if(opname == "Y_half")
+            {
+            Op.set(Up,DnP, -0.5 * Cplx_i);
+            Op.set(Dn,UpP, +0.5 * Cplx_i);
+            }
+        else if(opname == "Z_half")
+            {
+            Op.set(Up,UpP, +0.5);
+            Op.set(Dn,DnP, -0.5);
+            }
+        else if(opname == "Sz")
+            {
+            Op.set(Up,UpP, +0.5);
+            Op.set(Dn,DnP, -0.5);
+            }
+        else if(opname == "Sx")
+            {
+            Op.set(Up,DnP, +alpha);
+            Op.set(Dn,UpP, +0.5);
+            }
+        else if(opname == "ISy")
+            {
+            Op.set(Up,DnP, -0.5);
+            Op.set(Dn,UpP, +0.5);
+            }
+        else if(opname == "Sy")
+            {
+            Op.set(Up,DnP, +0.5 * Cplx_i);
+            Op.set(Dn,UpP, -0.5 * Cplx_i);
+            }
+        else if(opname == "Sp" || opname == "S+")
+            {
+            Op.set(Dn,UpP, 1.0);
+            }
+        else if(opname == "Sm" || opname == "S-")
+            {
+            Op.set(Up,DnP, 1.0);
+            }
+        else if(opname == "projUp")
+            {
+            Op.set(Up,UpP, 1.0);
+            }
+        else if(opname == "projDn")
+            {
+            Op.set(Dn,DnP, 1.0);
+            }
+        else if(opname == "S2")
+            {
+            Op.set(Up,UpP, 0.75);
+            Op.set(Dn,DnP, 0.75);
+            }
+        else
+            {
+            throw ITError("Operator \"" + opname + "\" name not recognized");
+            }
+
+        // Cache the result before returning
+        ITensor result = Op;
+        op_cache.put(cache_key, result);
+        
+        return result;
+        }
+
+    // Method to clear caches and free memory
+    void clearCaches() const {
+        op_cache.clear();
+        std::lock_guard<std::mutex> lock(exp_cache_mutex);
+        exp_cache.clear();
+    }
+
+    //
+    // Deprecated, for backwards compatibility
+    //
+
+    QubitSite(int n, Args const& args = Args::global())
+        {
+        *this = QubitSite({args,"SiteNumber=",n});
+        }
+
+    };
+
+// Static member initialization
+const std::complex<double> QubitSite::I_UNIT{0.0, 1.0};
+
+} //namespace itensor
